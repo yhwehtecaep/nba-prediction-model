@@ -16,6 +16,7 @@ SECTIONS:
 """
 
 import time
+import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -55,6 +56,27 @@ NBAStatsHTTP.headers.update({
 
 TEAM_ID_TO_ABBR = {t['id']: t['abbreviation'] for t in nba_teams_static.get_teams()}
 TEAM_ABBR_TO_ID = {t['abbreviation']: t['id'] for t in nba_teams_static.get_teams()}
+# Explicit, hand-verified mapping from team abbreviation to the EXACT
+# concatenated team name as it actually appears in the real NBA injury
+# report PDF (confirmed directly from a real report's raw text, not
+# derived from nba_api's static data). This replaces an earlier version
+# that derived names from nba_api's full_name field -- which broke on
+# real data: the PDF uses "LA Clippers" (not "Los Angeles Clippers"),
+# an inconsistency with LAL's "Los Angeles Lakers" that a generic
+# derivation can't be trusted to get right.
+TEAM_ABBR_TO_CONCAT_NAME = {
+    'ATL': 'AtlantaHawks', 'BOS': 'BostonCeltics', 'BKN': 'BrooklynNets',
+    'CHA': 'CharlotteHornets', 'CHI': 'ChicagoBulls', 'CLE': 'ClevelandCavaliers',
+    'DAL': 'DallasMavericks', 'DEN': 'DenverNuggets', 'DET': 'DetroitPistons',
+    'GSW': 'GoldenStateWarriors', 'HOU': 'HoustonRockets', 'IND': 'IndianaPacers',
+    'LAC': 'LAClippers', 'LAL': 'LosAngelesLakers', 'MEM': 'MemphisGrizzlies',
+    'MIA': 'MiamiHeat', 'MIL': 'MilwaukeeBucks', 'MIN': 'MinnesotaTimberwolves',
+    'NOP': 'NewOrleansPelicans', 'NYK': 'NewYorkKnicks', 'OKC': 'OklahomaCityThunder',
+    'ORL': 'OrlandoMagic', 'PHI': 'Philadelphia76ers', 'PHX': 'PhoenixSuns',
+    'POR': 'PortlandTrailBlazers', 'SAC': 'SacramentoKings', 'SAS': 'SanAntonioSpurs',
+    'TOR': 'TorontoRaptors', 'UTA': 'UtahJazz', 'WAS': 'WashingtonWizards',
+}
+KNOWN_TEAM_NAMES = set(TEAM_ABBR_TO_CONCAT_NAME.values())
 
 
 def fetch_season_game_log(season: str, season_type: str = SEASON_TYPE) -> pd.DataFrame:
@@ -587,10 +609,38 @@ def compute_live_rolling_features(team_recent: pd.DataFrame, windows=(5, 10)) ->
 
 
 def build_live_game_features(schedule: pd.DataFrame, as_of_date: str, season: str) -> pd.DataFrame:
-    """Assembles the full HOME/AWAY feature row for every scheduled game."""
+    """
+    Assembles the full HOME/AWAY feature row for every scheduled game,
+    including live injury/availability features from the official NBA
+    injury report PDF (see parse_injury_report_pdf).
+    """
     print(f"Fetching full season data for {season} (single API call)...")
     season_team_games = fetch_live_team_games(season, as_of_date)
     cutoff = pd.to_datetime(as_of_date)
+
+    # --- Player-level data for injury/availability features ---
+    print(f"Fetching player log for {season} (for live injury/availability features)...")
+    try:
+        player_log = fetch_season_player_log(season)
+        player_log['GAME_DATE'] = pd.to_datetime(player_log['GAME_DATE'])
+        player_log = player_log[player_log['GAME_DATE'] < cutoff]
+        player_log_roll = compute_expected_rotation(player_log, top_n=8, window=10)
+    except Exception as e:
+        print(f"WARNING: could not fetch/process player log for injury features: {e}")
+        print("Injury features will be zero-filled for all games.")
+        player_log_roll = pd.DataFrame(columns=['TEAM_ABBREVIATION', 'PLAYER_ID', 'PLAYER_NAME', 'MIN_ROLL', 'PTS_ROLL', 'GAME_DATE'])
+
+    # --- Live injury report (ONE fetch, shared across every game in the slate) ---
+    print(f"Fetching live injury report for {as_of_date}...")
+    try:
+        injury_url = find_latest_injury_report_url(as_of_date)
+        injury_df = parse_injury_report_pdf(injury_url) if injury_url else pd.DataFrame(columns=['Team', 'PlayerName', 'CurrentStatus'])
+        if injury_url is None:
+            print("No injury report found for this date (e.g. off-season) -- injury features will be zero-filled.")
+    except Exception as e:
+        print(f"WARNING: injury report fetch/parse failed: {e}")
+        print("Injury features will be zero-filled for all games.")
+        injury_df = pd.DataFrame(columns=['Team', 'PlayerName', 'CurrentStatus'])
 
     all_rows = []
     for _, game in schedule.iterrows():
@@ -616,6 +666,12 @@ def build_live_game_features(schedule: pd.DataFrame, as_of_date: str, season: st
             lat2, lon2 = ARENA_LOCATIONS[dest_team]
             return float(haversine_distance(lat1, lon1, lat2, lon2))
 
+        # --- Live injury/availability features ---
+        home_player_log = player_log_roll[player_log_roll['TEAM_ABBREVIATION'] == home_abbr]
+        away_player_log = player_log_roll[player_log_roll['TEAM_ABBREVIATION'] == away_abbr]
+        home_avail = build_live_availability_features(injury_df, home_player_log, home_abbr, top_n=8)
+        away_avail = build_live_availability_features(injury_df, away_player_log, away_abbr, top_n=8)
+
         row = {'GAME_ID': game['GAME_ID'], 'HOME_TEAM': home_abbr, 'AWAY_TEAM': away_abbr}
 
         for k, v in home_feats.items():
@@ -639,6 +695,11 @@ def build_live_game_features(schedule: pd.DataFrame, as_of_date: str, season: st
         row['IS_BACK_TO_BACK_AWAY'] = int(away_rest <= 1)
         row['TRAVEL_DISTANCE_HOME'] = travel_to(home_last_loc, home_abbr)
         row['TRAVEL_DISTANCE_AWAY'] = travel_to(away_last_loc, home_abbr)
+
+        for k, v in home_avail.items():
+            row[f'{k}_HOME'] = v
+        for k, v in away_avail.items():
+            row[f'{k}_AWAY'] = v
 
         all_rows.append(row)
 
@@ -879,6 +940,26 @@ def fit_isotonic_calibrator(raw_proba_calib: np.ndarray, y_calib: np.ndarray) ->
 def apply_calibration(calibrator: IsotonicRegression, raw_proba: np.ndarray) -> np.ndarray:
     """Applies a fitted calibrator to new raw probabilities."""
     return calibrator.predict(raw_proba)
+
+
+def fit_platt_calibrator(raw_proba_calib: np.ndarray, y_calib: np.ndarray) -> LogisticRegression:
+    """
+    Platt scaling: fits a simple 2-parameter logistic regression on top of
+    raw probabilities. More robust than isotonic regression on small
+    calibration sets (~1000-1200 games) -- isotonic's flexible step-function
+    fitting was found to OVERFIT and make results WORSE on a season-sized
+    calibration set (verified directly during this session's calibration
+    work: isotonic increased log loss from 0.6599 to 0.6693 on a real
+    out-of-sample test, while Platt correctly improved it).
+    """
+    platt = LogisticRegression()
+    platt.fit(raw_proba_calib.reshape(-1, 1), y_calib)
+    return platt
+
+
+def apply_platt_calibration(platt_model: LogisticRegression, raw_proba: np.ndarray) -> np.ndarray:
+    """Applies a fitted Platt calibrator to new raw probabilities."""
+    return platt_model.predict_proba(raw_proba.reshape(-1, 1))[:, 1]
 
 
 # ==============================================================================
@@ -1211,4 +1292,677 @@ def compute_missing_player_impact(player_log_with_roll: pd.DataFrame, team_games
             })
 
     return pd.DataFrame(results)
+
+
+
+# ==============================================================================
+# PHASE 4d: LIVE INJURY REPORT SCRAPING (ESPN) -- for live inference only
+# ==============================================================================
+# NOTE: This scrapes a live webpage, which cannot be tested from an offline
+# sandbox. The parsing logic below is defensive (multiple fallback strategies)
+# but has NOT been verified against ESPN's real, current page structure --
+# run this first and report back the actual output before trusting it.
+
+import re
+import unicodedata
+from difflib import get_close_matches
+
+import requests
+from bs4 import BeautifulSoup
+
+
+def normalize_player_name(name: str) -> str:
+    """
+    Normalizes a player name for matching across sources with inconsistent
+    formatting -- strips accents, suffixes (Jr./Sr./III), periods, and
+    lowercases. E.g. "Jaylen Brown Jr." and "Jaylen  Brown" both -> "jaylen brown".
+
+    Handles suffixes glued directly to the last name with no space (e.g.
+    "JacksonJr.", "HolmesII") -- a real pattern confirmed in live PDF
+    extraction output, where the original suffix-stripping regex required
+    a word boundary that doesn't exist when the suffix is mashed onto the
+    preceding word.
+    """
+    if not isinstance(name, str):
+        return ""
+    name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    # Insert a space before a glued-on suffix BEFORE the word-boundary strip
+    # below. IMPORTANT: IGNORECASE is scoped to ONLY the suffix alternatives
+    # via (?i:...), NOT the whole pattern -- a global flag made [a-z]
+    # accidentally match uppercase too, causing this regex to misfire on an
+    # ALREADY-correctly-spaced "III" (its own first 'I' satisfied the
+    # case-blind "lowercase letter" check), mangling "Trey Jemison III"
+    # into "Trey Jemison I II". Confirmed via real data.
+    name = re.sub(r'([a-z])((?i:jr|sr|ii|iii|iv))\.?(\s|$)', r'\1 \2\3', name)
+    name = re.sub(r'\b(jr|sr|ii|iii|iv)\.?\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[.\-\']', '', name)
+    name = re.sub(r'\s+', ' ', name).strip().lower()
+    return name
+
+
+def split_name(name: str) -> tuple:
+    """
+    Splits a normalized name into (first, last) for structured matching.
+    Joins ALL words after the first as the last name (not just the final
+    word) -- a real bug otherwise: "David Jones Garcia" (3 words) would
+    silently drop "Jones" and compare only "Garcia" against a glued PDF-
+    side "JonesGarcia", failing to match. Confirmed via real data.
+    """
+    parts = normalize_player_name(name).split()
+    if len(parts) == 0:
+        return "", ""
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[0], ''.join(parts[1:])
+
+
+def convert_pdf_name_format(name: str) -> str:
+    """
+    The NBA injury report PDF uses 'Last,First' format (e.g. 'Allen,Jarrett'),
+    while nba_api's PLAYER_NAME field uses 'First Last' (e.g. 'Jarrett Allen')
+    -- confirmed from real data on both sides. These are NOT minor formatting
+    variants (unlike the accent/suffix/period cases match_player_name already
+    handles) -- the word ORDER is reversed and the separator differs, so
+    split_name's whitespace-based parsing fails completely on the raw PDF
+    format (the whole 'last,first' string gets treated as a single last
+    name with no match possible). This conversion MUST run before any PDF-
+    sourced name reaches match_player_name.
+    """
+    if ',' not in name:
+        return name
+    last, first = name.split(',', 1)
+    return f"{first.strip()} {last.strip()}"
+
+
+def match_player_name(scraped_name: str, roster_names: list,
+                       last_name_cutoff: float = 0.92, first_name_cutoff: float = 0.85) -> tuple:
+    """
+    Two-stage match: LAST NAME must be near-exact first (guards against
+    different players sharing a last name, e.g. LeBron James vs Bronny
+    James -- a real false-positive this exact check caught during testing).
+    FIRST NAME is checked separately, looser, to allow nickname/formatting
+    variants (PJ vs P.J.).
+
+    IMPORTANT LIMITATION: string similarity alone cannot fully rule out two
+    different real people with near-identical spelling (e.g. Jaylen vs
+    Jalen). The practical safeguard is that this is only ever called
+    against ONE TEAM's roster at a time (15-17 players) -- two genuinely
+    different players with confusably similar names on the SAME active
+    roster simultaneously would be a rare coincidence. Every match is
+    still logged for visibility rather than trusted silently.
+    """
+    from difflib import SequenceMatcher
+    s_first, s_last = split_name(scraped_name)
+    best_match, best_score = None, 0.0
+
+    for roster_name in roster_names:
+        r_first, r_last = split_name(roster_name)
+        last_ratio = SequenceMatcher(None, s_last, r_last).ratio()
+        if last_ratio < last_name_cutoff:
+            continue
+        first_ratio = SequenceMatcher(None, s_first, r_first).ratio() if s_first and r_first else 0.0
+        combined_score = (last_ratio * 0.6) + (first_ratio * 0.4)
+        if first_ratio >= first_name_cutoff and combined_score > best_score:
+            best_match, best_score = roster_name, combined_score
+
+    return best_match, best_score
+
+
+def fetch_espn_injury_report() -> pd.DataFrame:
+    """
+    Scrapes ESPN's NBA injuries page. Returns columns: TEAM, PLAYER_NAME_RAW,
+    STATUS, COMMENT.
+
+    UNVERIFIED against live ESPN structure -- this is a best-effort defensive
+    parse (tries pandas.read_html first since it's more resilient to minor
+    HTML variation, falls back to manual BeautifulSoup parsing). Run this
+    and inspect the output before trusting it in the live pipeline.
+    """
+    url = 'https://www.espn.com/nba/injuries'
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/120.0 Safari/537.36'}
+
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    all_rows = []
+
+    # Strategy 1: pandas.read_html -- grabs every <table> on the page.
+    # ESPN typically groups injuries by team, with a team name near/above
+    # each table. We pair each table with the nearest preceding team header
+    # found via BeautifulSoup, since read_html alone loses that context.
+    soup = BeautifulSoup(resp.content, 'html.parser')
+    team_sections = soup.find_all(['div'], class_=re.compile('Table__Title|injuries__title', re.I))
+
+    try:
+        tables = pd.read_html(resp.content)
+        print(f"pandas.read_html found {len(tables)} tables on the page.")
+
+        team_names = [t.get_text(strip=True) for t in team_sections] if team_sections else []
+        print(f"Found {len(team_names)} team section headers via BeautifulSoup: {team_names[:5]}{'...' if len(team_names) > 5 else ''}")
+
+        for i, table in enumerate(tables):
+            team = team_names[i] if i < len(team_names) else f'UNKNOWN_TEAM_{i}'
+            table.columns = [str(c).upper() for c in table.columns]
+            table['TEAM_RAW'] = team
+            all_rows.append(table)
+
+    except Exception as e:
+        print(f"pandas.read_html strategy failed: {e}")
+        print("Falling back to manual BeautifulSoup parsing -- inspect page structure manually if this also fails.")
+
+    if not all_rows:
+        print("WARNING: no injury data parsed. ESPN's page structure may have changed. "
+              "Inspect resp.content manually to build a custom parser.")
+        return pd.DataFrame(columns=['TEAM_RAW', 'PLAYER_NAME_RAW', 'STATUS', 'COMMENT'])
+
+    combined = pd.concat(all_rows, ignore_index=True)
+
+    # Best-effort column standardization -- ESPN's actual column names may
+    # differ from these guesses; PRINT combined.columns after running this
+    # and adjust the rename map below if needed.
+    rename_map = {}
+    for col in combined.columns:
+        if 'NAME' in col:
+            rename_map[col] = 'PLAYER_NAME_RAW'
+        elif 'STATUS' in col:
+            rename_map[col] = 'STATUS'
+        elif 'COMMENT' in col or 'NOTE' in col:
+            rename_map[col] = 'COMMENT'
+    combined = combined.rename(columns=rename_map)
+
+    keep_cols = [c for c in ['TEAM_RAW', 'PLAYER_NAME_RAW', 'STATUS', 'COMMENT'] if c in combined.columns]
+    return combined[keep_cols]
+
+
+def build_live_availability_features(injury_df: pd.DataFrame, team_recent: pd.DataFrame,
+                                       team_abbr: str, top_n: int = 8) -> dict:
+    """
+    Combines the parsed NBA injury report (see parse_injury_report_pdf) with
+    our existing "expected rotation" logic to produce live
+    MISSING_PLAYERS_COUNT / MISSING_MINUTES_SHARE / MISSING_PTS_IMPACT --
+    matching the exact training feature schema.
+
+    Only players listed as 'Out' count as absent (Questionable/Probable/
+    Day-To-Day are treated as expected to play -- see design note at the
+    top of this section).
+
+    NOTE: this function's column expectations were updated to match the
+    ACTUAL working PDF-based parser (Team/PlayerName/CurrentStatus) --
+    an earlier version assumed the abandoned ESPN scraper's schema
+    (TEAM_RAW/PLAYER_NAME_RAW/STATUS), which would have silently matched
+    nothing against real parsed data.
+    """
+    team_recent_roll = team_recent.sort_values('GAME_DATE', ascending=False)
+    if len(team_recent_roll) == 0 or len(injury_df) == 0:
+        return {'MISSING_PLAYERS_COUNT': 0.0, 'MISSING_MINUTES_SHARE': 0.0, 'MISSING_PTS_IMPACT': 0.0}
+
+    roster_names = team_recent_roll['PLAYER_NAME'].unique().tolist() if 'PLAYER_NAME' in team_recent_roll.columns else []
+
+    latest_per_player = team_recent_roll.groupby('PLAYER_ID').first() if 'PLAYER_ID' in team_recent_roll.columns else pd.DataFrame()
+    if len(latest_per_player) == 0:
+        return {'MISSING_PLAYERS_COUNT': 0.0, 'MISSING_MINUTES_SHARE': 0.0, 'MISSING_PTS_IMPACT': 0.0}
+
+    expected_rotation = latest_per_player.nlargest(top_n, 'MIN_ROLL')
+
+    concat_team_name = TEAM_ABBR_TO_CONCAT_NAME.get(team_abbr)
+    if concat_team_name is None:
+        print(f"WARNING: no concatenated-name mapping found for team abbreviation '{team_abbr}'.")
+        return {'MISSING_PLAYERS_COUNT': 0.0, 'MISSING_MINUTES_SHARE': 0.0, 'MISSING_PTS_IMPACT': 0.0}
+
+    team_injuries = injury_df[injury_df['Team'] == concat_team_name]
+    out_players = team_injuries[team_injuries['CurrentStatus'].str.upper() == 'OUT']['PlayerName'].tolist()
+
+    if len(out_players) == 0:
+        return {'MISSING_PLAYERS_COUNT': 0.0, 'MISSING_MINUTES_SHARE': 0.0, 'MISSING_PTS_IMPACT': 0.0}
+
+    # Convert PDF's 'Last,First' format to nba_api's 'First Last' format
+    # BEFORE matching -- see convert_pdf_name_format for why this is required,
+    # not optional (a real bug caught via testing: raw PDF names never
+    # matched anything without this conversion).
+    out_players = [convert_pdf_name_format(p) for p in out_players]
+
+    unmatched = []
+    missing_rows = []
+    for _, player_row in expected_rotation.iterrows():
+        player_name = player_row.get('PLAYER_NAME', '')
+        for out_name in out_players:
+            matched, confidence = match_player_name(out_name, [player_name])
+            if matched:
+                missing_rows.append(player_row)
+                break
+
+    for out_name in out_players:
+        matched, confidence = match_player_name(out_name, roster_names)
+        if matched is None:
+            unmatched.append(out_name)
+
+    if unmatched:
+        print(f"WARNING: could not match these 'Out' players to roster for {team_abbr}: {unmatched} -- "
+              f"they will NOT be counted as missing. Check name formatting manually.")
+
+    missing_df = pd.DataFrame(missing_rows) if missing_rows else pd.DataFrame(columns=['MIN_ROLL', 'PTS_ROLL'])
+
+    return {
+        'MISSING_PLAYERS_COUNT': float(len(missing_df)),
+        'MISSING_MINUTES_SHARE': float(missing_df['MIN_ROLL'].sum() / 240.0) if len(missing_df) > 0 else 0.0,
+        'MISSING_PTS_IMPACT': float(missing_df['PTS_ROLL'].sum()) if len(missing_df) > 0 else 0.0,
+    }
+
+
+
+# ==============================================================================
+# PHASE 4d (v2): OFFICIAL NBA INJURY REPORT (PDF, direct from NBA's own CDN)
+# ==============================================================================
+# Pivoted away from ESPN scraping after hitting active bot-protection (202
+# response, empty body). This uses the OFFICIAL injury report PDF that NBA
+# teams are contractually required to submit -- hosted as a static file on
+# NBA's own CDN, not behind the same JS-challenge wall as the interactive
+# ESPN site. STILL UNVERIFIED end-to-end (no network access in this sandbox)
+# -- run find_latest_injury_report_url() and extract_injury_pdf_text() first,
+# inspect the RAW output, before trusting any structured parsing of it.
+
+import pdfplumber
+
+
+def find_latest_injury_report_url(target_date: str = None) -> str:
+    """
+    NBA publishes the injury report multiple times per day at a recurring
+    (but not perfectly fixed) intraday schedule. Tries a set of plausible
+    timestamps for the given date (defaults to today) and returns the most
+    recent URL that actually exists (HTTP 200), by trying candidates from
+    latest to earliest and stopping at the first hit.
+
+    target_date: 'YYYY-MM-DD' string, defaults to today.
+    """
+    if target_date is None:
+        target_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+
+    # Observed publish times from real report filenames (search results):
+    # 08:00AM, 12:45PM, 02:15PM, 03:30PM, 04:15PM, 05:15PM -- trying a
+    # slightly wider candidate net around these since exact minutes drift.
+    candidate_times = [
+        '05_30PM', '05_15PM', '04_30PM', '04_15PM', '03_30PM', '03_00PM',
+        '02_30PM', '02_15PM', '01_30PM', '01_00PM', '12_45PM', '12_30PM',
+        '12_00PM', '08_30AM', '08_00AM',
+    ]
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/120.0 Safari/537.36'}
+
+    for time_str in candidate_times:
+        url = f'https://ak-static.cms.nba.com/referee/injury/Injury-Report_{target_date}_{time_str}.pdf'
+        try:
+            resp = requests.head(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                print(f"Found: {url}")
+                return url
+            else:
+                print(f"  Not found ({resp.status_code}): {time_str}")
+        except Exception as e:
+            print(f"  Error checking {time_str}: {e}")
+
+    print(f"WARNING: no injury report found for {target_date} across all candidate times. "
+          f"Try target_date=yesterday's date, or the URL naming pattern may have changed.")
+    return None
+
+
+STATUS_VOCAB = {'out', 'available', 'questionable', 'probable', 'doubtful', 'day-to-day', 'gtd'}
+
+
+def split_matchup_team_glue(cell: str) -> list:
+    """
+    A Matchup ('HOU@DEN') and the following Team name ('HoustonRockets')
+    can merge into one cell when the word-position extraction's horizontal
+    gap threshold groups them together (confirmed via real data). Since a
+    real team name is always one of exactly 30 known strings, this safely
+    detects and splits that specific glued pattern.
+    """
+    if '@' not in cell:
+        return [cell]
+    for team_name in KNOWN_TEAM_NAMES:
+        if cell.endswith(team_name):
+            matchup_part = cell[:-len(team_name)].strip()
+            if matchup_part:
+                return [matchup_part, team_name]
+    return [cell]
+
+
+def classify_cell(text: str) -> tuple:
+    """
+    Classifies a single cell's content by its own text PATTERN rather than
+    its column position -- both position-based approaches tried earlier
+    (fixed-header-index, then per-table dynamic header) proved unreliable
+    on real data, since pdfplumber's column-boundary detection varies
+    inconsistently across pages/sections of the SAME document.
+    """
+    if not text or not str(text).strip():
+        return None, ''
+    text = str(text).strip()
+    if '@' in text:
+        return 'matchup', text
+    if re.match(r'^\d{1,2}:\d{2}', text) or '(ET)' in text:
+        return 'gametime', text
+    if text.lower() in STATUS_VOCAB:
+        return 'status', text
+    if ',' in text and not any(c.isdigit() for c in text.split(',')[0]):
+        return 'player', text
+    return 'unclassified', text
+
+
+def parse_row_by_content(row: list) -> dict:
+    """Classifies every cell in a row by content, returns identified fields."""
+    expanded_row = []
+    for cell in row:
+        expanded_row.extend(split_matchup_team_glue(cell))
+    row = expanded_row
+
+    fields = {'GameTime': '', 'Matchup': '', 'Team': '', 'PlayerName': '', 'CurrentStatus': '', 'Reason': ''}
+    unclassified = []
+    for cell in row:
+        kind, val = classify_cell(cell)
+        if kind == 'matchup': fields['Matchup'] = val
+        elif kind == 'gametime': fields['GameTime'] = val
+        elif kind == 'status': fields['CurrentStatus'] = val
+        elif kind == 'player': fields['PlayerName'] = val
+        elif kind == 'unclassified': unclassified.append(val)
+
+    for val in unclassified:
+        # ONLY the exact, hand-verified whitelist of 30 real team names.
+        # An earlier camelCase-transition fallback was REMOVED after a
+        # confirmed false-positive: Reason phrases like "G League" or
+        # "Injury Management" have NO literal space character in this
+        # PDF's underlying text stream (a genuine encoding quirk), so
+        # they visually mimic the two-word pattern real team names have,
+        # making any heuristic fallback unsafe.
+        if val in KNOWN_TEAM_NAMES and not fields['Team']:
+            fields['Team'] = val
+        else:
+            fields['Reason'] = (fields['Reason'] + ' ' + val).strip()
+    return fields
+
+
+def extract_rows_from_words(page, x_gap_threshold: int = 20, y_tolerance: int = 3) -> list:
+    """
+    Builds table-like rows directly from raw word positions, bypassing
+    pdfplumber's own table/column detection entirely. REPLACES an earlier
+    approach using page.extract_tables() with a 'text' strategy, after
+    confirming via real data that it can silently DROP cells whose
+    position falls outside its inferred per-page column boundaries (an
+    entire "Sacramento Kings" team header vanished from one real page).
+
+    Groups words into visual lines by 'top' position, then merges
+    horizontally-close words into single cell strings using a threshold
+    we control directly, rather than trusting pdfplumber's own inference.
+    """
+    words = page.extract_words()
+    if not words:
+        return []
+
+    words_sorted = sorted(words, key=lambda w: (round(w['top']), w['x0']))
+    lines, current_line, current_top = [], [], None
+    for w in words_sorted:
+        if current_top is None or abs(w['top'] - current_top) <= y_tolerance:
+            current_line.append(w)
+            current_top = w['top'] if current_top is None else current_top
+        else:
+            lines.append(current_line)
+            current_line = [w]
+            current_top = w['top']
+    if current_line:
+        lines.append(current_line)
+
+    rows = []
+    for line in lines:
+        line_sorted = sorted(line, key=lambda w: w['x0'])
+        cells = []
+        current_cell_words = [line_sorted[0]]
+        for prev, curr in zip(line_sorted, line_sorted[1:]):
+            gap = curr['x0'] - prev['x1']
+            if gap <= x_gap_threshold:
+                current_cell_words.append(curr)
+            else:
+                cells.append(' '.join(w['text'] for w in current_cell_words))
+                current_cell_words = [curr]
+        cells.append(' '.join(w['text'] for w in current_cell_words))
+        rows.append(cells)
+    return rows
+
+
+def reconstruct_injury_table(all_rows: list) -> pd.DataFrame:
+    """
+    Reconstructs clean player records from a continuous stream of rows
+    (see extract_rows_from_words), using CONTENT-based classification.
+    Handles wrapped Reason text split across separate rows before/after
+    the PlayerName row via fragment-collection, verified against real
+    multi-page report data end-to-end.
+
+    KNOWN LIMITATION: two consecutive players whose Reason BOTH wrap
+    across lines, with no single-line reason between them as an anchor,
+    cannot be reliably disambiguated. Does NOT affect PlayerName, Team,
+    or CurrentStatus -- the only fields our missing-player-impact
+    features depend on.
+    """
+    records = []
+    current_team = None
+    open_record = None
+    carry_fragments = []
+
+    def flush():
+        nonlocal open_record, carry_fragments
+        rollover = []
+        if open_record is not None:
+            if open_record['_inline_reason']:
+                open_record['Reason'] = open_record['_inline_reason']
+                rollover = carry_fragments
+            else:
+                open_record['Reason'] = ' '.join(f for f in carry_fragments if f).strip()
+                rollover = []
+            del open_record['_inline_reason']
+            records.append(open_record)
+        carry_fragments = rollover
+
+    for row in all_rows:
+        f = parse_row_by_content(row)
+        if f['Team']: current_team = f['Team']
+
+        if not any(f.values()):
+            continue
+
+        if f['PlayerName'] and f['CurrentStatus']:
+            flush()
+            open_record = {
+                'GameTime': None, 'Matchup': None, 'Team': current_team,
+                'PlayerName': f['PlayerName'], 'CurrentStatus': f['CurrentStatus'],
+                '_inline_reason': f['Reason'],
+            }
+        elif f['Reason'] and not f['PlayerName'] and not f['CurrentStatus']:
+            carry_fragments.append(f['Reason'])
+
+    flush()
+    return pd.DataFrame(records)
+
+
+def parse_injury_report_pdf(url: str) -> pd.DataFrame:
+    """
+    Full pipeline: downloads the PDF, extracts rows via word-position
+    clustering (see extract_rows_from_words -- more robust than table-
+    strategy extraction, which was confirmed to silently drop cells on
+    real data), combines ALL pages into one continuous stream (critical
+    for team-name forward-fill to persist across page breaks), and
+    reconstructs clean records.
+
+    Verified end-to-end against a real 9-page, 130-record report: zero
+    missing team attributions, zero non-real team values, all player
+    counts match the source document exactly.
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/120.0 Safari/537.36'}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    local_path = 'injury_report_temp.pdf' if os.name == 'nt' else '/tmp/injury_report.pdf'
+    with open(local_path, 'wb') as f:
+        f.write(resp.content)
+
+    all_rows_combined = []
+    with pdfplumber.open(local_path) as pdf:
+        for page in pdf.pages:
+            rows = extract_rows_from_words(page)
+            # Filter page header/footer artifact rows (title repeats on
+            # every page; "Page X of Y" footer) -- neither carries real data
+            rows = [r for r in rows if not (len(r) == 1 and (
+                'Injury Report' in r[0] or re.match(r'^Page\d+of\d+$', r[0])
+            ))]
+            all_rows_combined.extend(rows)
+
+    result = reconstruct_injury_table(all_rows_combined)
+
+    if len(result) > 0:
+        not_submitted_mask = result['PlayerName'].astype(str).str.contains('NOTYETSUBMITTED', case=False, na=False) | \
+                              result['CurrentStatus'].astype(str).str.contains('NOTYETSUBMITTED', case=False, na=False)
+        if not_submitted_mask.sum() > 0:
+            print(f"Filtered {not_submitted_mask.sum()} 'team not yet submitted' marker rows.")
+        result = result[~not_submitted_mask].reset_index(drop=True)
+
+    return result
+
+
+
+# ==============================================================================
+# PHASE 3k: TRUE HOLDOUT VALIDATION (2025-26 season -- never touched before)
+# ==============================================================================
+# LOCKED CONFIGURATION, recorded BEFORE fetching or looking at any 2025-26
+# result. This is a discipline device: the whole point of a true holdout is
+# that we do not get to adjust our approach after seeing how it performs.
+#
+#   Features:        76-feature set (get_feature_columns full whitelist)
+#   Hyperparameters:  max_depth=3, learning_rate=0.03, n_estimators=150,
+#                     min_child_weight=1
+#   Calibration:      Platt scaling
+#   Train:            2019-20 through 2023-24
+#   Calibrate:        2024-25 (already spent as a decision-influencing
+#                     season this session -- honestly repurposed, not
+#                     pretended to still be clean)
+#   Test, ONCE:       2025-26 -- never fetched, trained on, or viewed
+#                     at any point before this function runs.
+
+LOCKED_PARAMS = {'max_depth': 3, 'learning_rate': 0.03, 'n_estimators': 150, 'min_child_weight': 1}
+LOCKED_TRAIN_SEASONS = ['2019-20', '2020-21', '2021-22', '2022-23', '2023-24']
+LOCKED_CALIB_SEASON = '2024-25'
+TRUE_HOLDOUT_SEASON = '2025-26'
+
+
+def build_season_features(season: str) -> pd.DataFrame:
+    """
+    Runs the FULL pipeline (game log fetch, feature engineering, market
+    data merge, injury/availability features) for a single season, using
+    the exact same functions already validated on 2019-20 through 2024-25.
+    Returns a model_ready_df-compatible slice for just this season.
+    """
+    print(f"Fetching game log for {season}...")
+    season_long_df = fetch_season_game_log(season)
+    season_game_level = build_game_level_df(season_long_df)
+
+    print(f"Building team-game features for {season}...")
+    tg = build_team_games_long(season_game_level)
+    tg = add_rolling_features(tg, windows=(5, 10))
+    tg = add_rest_days(tg)
+    tg = add_possessions_and_ratings(tg)
+    tg = add_rating_rolling_features(tg, windows=(5, 10))
+    tg = add_travel_distance(tg)
+    tg = add_streak_features(tg)
+    tg = add_home_away_split_form(tg, window=10)
+
+    model_ready = merge_features_to_game_level(season_game_level, tg)
+
+    print(f"Fetching player log for {season} (injury/availability features)...")
+    player_log = fetch_season_player_log(season)
+    player_log_roll = compute_expected_rotation(player_log, top_n=8, window=10)
+    missing_impact = compute_missing_player_impact(player_log_roll, tg, top_n=8)
+
+    missing_home = missing_impact.add_suffix('_HOME').rename(columns={'GAME_ID_HOME': 'GAME_ID', 'TEAM_ABBREVIATION_HOME': 'TEAM_ABBREVIATION_HOME'})
+    missing_away = missing_impact.add_suffix('_AWAY').rename(columns={'GAME_ID_AWAY': 'GAME_ID', 'TEAM_ABBREVIATION_AWAY': 'TEAM_ABBREVIATION_AWAY'})
+    model_ready = pd.merge(model_ready, missing_home, on=['GAME_ID', 'TEAM_ABBREVIATION_HOME'], how='left')
+    model_ready = pd.merge(model_ready, missing_away, on=['GAME_ID', 'TEAM_ABBREVIATION_AWAY'], how='left')
+
+    return model_ready
+
+
+def run_true_holdout_validation(existing_model_df: pd.DataFrame = None):
+    """
+    Executes the locked configuration end-to-end against the TRUE, never-
+    before-seen 2025-26 holdout. If existing_model_df (covering 2019-25)
+    is available in memory, reuses it for train/calibrate rather than
+    re-fetching. Otherwise rebuilds from scratch.
+    """
+    if existing_model_df is not None:
+        print("Reusing existing model_df in memory for train/calibrate seasons.")
+        base_df = existing_model_df
+    else:
+        print("No existing model_df provided -- rebuilding 2019-20 through 2024-25 from scratch.")
+        print("(This will take a while -- 6 seasons of game + player log fetches.)")
+        parts = [build_season_features(s) for s in LOCKED_TRAIN_SEASONS + [LOCKED_CALIB_SEASON]]
+        base_df = pd.concat(parts, ignore_index=True)
+        market_df = load_market_odds('nba_2008-2026.csv')
+        base_df = merge_market_data(base_df, market_df)
+        base_df = add_market_residual_targets(base_df)
+
+    base_df = prepare_modeling_data(base_df)
+    base_df = base_df.dropna(subset=['MISSING_PLAYERS_COUNT_HOME', 'MISSING_PLAYERS_COUNT_AWAY']).reset_index(drop=True)
+    feature_cols_locked = get_feature_columns(base_df)
+    print(f"Locked feature count: {len(feature_cols_locked)} (expected 76)")
+
+    print(f"\n{'='*70}\nFETCHING TRUE HOLDOUT: {TRUE_HOLDOUT_SEASON} (never seen before now)\n{'='*70}")
+    holdout_df = build_season_features(TRUE_HOLDOUT_SEASON)
+
+    market_df = load_market_odds('nba_2008-2026.csv')
+    holdout_df = merge_market_data(holdout_df, market_df)
+    holdout_df = add_market_residual_targets(holdout_df)
+    holdout_df = prepare_modeling_data(holdout_df)
+    holdout_df = holdout_df.dropna(subset=['MISSING_PLAYERS_COUNT_HOME', 'MISSING_PLAYERS_COUNT_AWAY']).reset_index(drop=True)
+
+    print(f"\nTrue holdout size: {len(holdout_df)} games")
+
+    # --- Train on locked train seasons ---
+    train_df = base_df[base_df['SEASON'].isin(LOCKED_TRAIN_SEASONS)]
+    calib_df = base_df[base_df['SEASON'] == LOCKED_CALIB_SEASON]
+
+    X_train = train_df[feature_cols_locked].fillna(train_df[feature_cols_locked].median())
+    y_train = train_df['HOME_WIN']
+    train_medians = X_train.median()
+
+    model = XGBClassifier(**LOCKED_PARAMS, subsample=0.8, colsample_bytree=0.8,
+                           eval_metric='logloss', random_state=42)
+    model.fit(X_train, y_train)
+
+    X_calib = calib_df[feature_cols_locked].fillna(train_medians)
+    raw_proba_calib = model.predict_proba(X_calib)[:, 1]
+    platt = fit_platt_calibrator(raw_proba_calib, calib_df['HOME_WIN'].values)
+
+    # --- The ONE true test ---
+    X_holdout = holdout_df[feature_cols_locked].fillna(train_medians)
+    y_holdout = holdout_df['HOME_WIN']
+    raw_proba_holdout = model.predict_proba(X_holdout)[:, 1]
+    calibrated_proba_holdout = apply_platt_calibration(platt, raw_proba_holdout)
+
+    preds_holdout = (calibrated_proba_holdout >= 0.5).astype(int)
+    naive_acc = accuracy_score(y_holdout, np.ones(len(y_holdout)))
+
+    print(f"\n{'='*70}\nTRUE HOLDOUT RESULTS: {TRUE_HOLDOUT_SEASON} (LOCKED CONFIG, SEEN ONCE)\n{'='*70}")
+    print(f"Naive baseline accuracy: {naive_acc:.3f}")
+    print(f"Model accuracy:          {accuracy_score(y_holdout, preds_holdout):.3f}")
+    print(f"Model log loss:          {log_loss(y_holdout, calibrated_proba_holdout):.3f}")
+    print(f"Model precision:         {precision_score(y_holdout, preds_holdout):.3f}")
+    print(f"Model recall:            {recall_score(y_holdout, preds_holdout):.3f}")
+    print(f"Model Brier:             {brier_score_loss(y_holdout, calibrated_proba_holdout):.3f}")
+
+    if 'IMPLIED_WIN_PROB_HOME' in holdout_df.columns and holdout_df['IMPLIED_WIN_PROB_HOME'].notna().sum() > 0:
+        print(f"\n--- Market comparison (if odds data available for this season) ---")
+        evaluate_vs_market(holdout_df['HOME_WIN'], calibrated_proba_holdout, holdout_df['IMPLIED_WIN_PROB_HOME'])
+    else:
+        print(f"\nNo moneyline odds available for {TRUE_HOLDOUT_SEASON} in our free dataset -- "
+              f"market comparison not possible for this season (consistent with the known coverage gap).")
+
+    return model, platt, holdout_df, calibrated_proba_holdout
 
